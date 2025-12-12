@@ -6,7 +6,7 @@ RED="\033[1;31m"
 YELLOW="\033[1;33m"
 NC="\033[0m"
 
-log()  { echo -e "${GREEN}[OK]${NC} $*"; }
+ok()   { echo -e "${GREEN}[OK]${NC} $*"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 err()  { echo -e "${RED}[ERR]${NC} $*"; }
 
@@ -22,92 +22,91 @@ detect_arch() {
     x86_64)  ARCH="amd64" ;;
     aarch64) ARCH="arm64" ;;
     *)
-      err "$(uname -m) 架构不支持"
+      err "不支持的架构: $(uname -m)"
       exit 1
       ;;
   esac
 }
 
-need_cmd() {
-  command -v "$1" >/dev/null 2>&1
+need_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+apt_install() {
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y >/dev/null
+  apt-get install -y "$@" >/dev/null
 }
 
-install_pkgs_if_needed() {
-  # 确保基础工具存在
+ensure_base_tools() {
   local pkgs=()
   need_cmd curl || pkgs+=("curl")
   need_cmd wget || pkgs+=("wget")
   need_cmd tar  || pkgs+=("tar")
   need_cmd ss   || pkgs+=("iproute2")
-
-  if ((${#pkgs[@]} > 0)); then
-    warn "安装依赖: ${pkgs[*]}"
-    apt-get update -y
-    apt-get install -y "${pkgs[@]}"
+  if ((${#pkgs[@]})); then
+    warn "安装基础依赖: ${pkgs[*]}"
+    apt_install "${pkgs[@]}"
   fi
 }
 
 ensure_firewall_tools() {
-  # 判断 iptables / netfilter-persistent 是否存在，不存在则安装
   local pkgs=()
-
   need_cmd iptables || pkgs+=("iptables")
-  # Debian/Ubuntu 持久化通常由 iptables-persistent + netfilter-persistent 提供
-  if ! need_cmd netfilter-persistent; then
-    pkgs+=("iptables-persistent" "netfilter-persistent")
-  fi
-
-  if ((${#pkgs[@]} > 0)); then
-    warn "检测到缺少防火墙组件，准备安装: ${pkgs[*]}"
-    # 避免 iptables-persistent 安装时交互
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y
-    apt-get install -y "${pkgs[@]}"
+  need_cmd netfilter-persistent || pkgs+=("iptables-persistent" "netfilter-persistent")
+  if ((${#pkgs[@]})); then
+    warn "安装防火墙依赖: ${pkgs[*]}"
+    apt_install "${pkgs[@]}"
   fi
 }
 
 github_latest_tag() {
-  # $1: owner/repo
-  local project="$1"
-  curl -fsSL "https://api.github.com/repos/${project}/releases/latest" \
-    | awk -F'"' '/"tag_name"\s*:\s*"/ {print $4; exit}'
+  # 用 GitHub API 获取 latest release tag（修复 awk \s 不兼容问题）
+  local repo="$1"
+  curl -fsSL "https://api.github.com/repos/${repo}/releases/latest" \
+    | awk -F'"' '/"tag_name"[[:space:]]*:[[:space:]]*"/ {print $4; exit}'
 }
 
 ensure_user() {
-  # $1: username
   local u="$1"
-  if id "$u" >/dev/null 2>&1; then
-    return 0
+  if ! id "$u" >/dev/null 2>&1; then
+    useradd -rs /bin/false "$u"
   fi
-  useradd -rs /bin/false "$u"
 }
 
-port_in_use() {
-  # $1: port
-  local p="$1"
-  ss -tuln | grep -q ":${p}\b"
+port_listening() {
+  local port="$1"
+  ss -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]${port}$"
+}
+
+service_active() {
+  local svc="$1"
+  systemctl is-active --quiet "${svc}"
+}
+
+download_and_install_binary() {
+  # $1=url  $2=tar_prefix  $3=binary_name  $4=install_path
+  local url="$1" prefix="$2" bin="$3" dst="$4"
+  local tmp
+  tmp="$(mktemp -d)"
+  wget -qO "${tmp}/pkg.tgz" "${url}"
+  tar -xzf "${tmp}/pkg.tgz" -C "${tmp}"
+  install -m 0755 "${tmp}/${prefix}/${bin}" "${dst}"
+  rm -rf "${tmp}"
 }
 
 install_node_exporter() {
-  local project="prometheus/node_exporter"
-  local tag version url tmpdir
+  local tag version url prefix
 
-  tag="$(github_latest_tag "${project}")"
+  tag="$(github_latest_tag "prometheus/node_exporter")"
+  [[ -n "${tag}" ]] || { err "获取 node_exporter tag 失败"; exit 1; }
   version="${tag#v}"
   url="https://github.com/prometheus/node_exporter/releases/download/${tag}/node_exporter-${version}.linux-${ARCH}.tar.gz"
+  prefix="node_exporter-${version}.linux-${ARCH}"
 
-  log "Node Exporter 最新版本: ${tag}"
+  ok "Node Exporter 最新版本: ${tag}"
 
   ensure_user "node_exporter"
 
-  tmpdir="$(mktemp -d)"
-  wget -qO "${tmpdir}/node_exporter.tar.gz" "${url}"
-  tar -xzf "${tmpdir}/node_exporter.tar.gz" -C "${tmpdir}"
-
-  # 覆盖安装
-  install -m 0755 "${tmpdir}/node_exporter-"*/node_exporter /usr/local/bin/node_exporter
-
-  rm -rf "${tmpdir}"
+  download_and_install_binary "${url}" "${prefix}" "node_exporter" "/usr/local/bin/node_exporter"
 
   cat > /etc/systemd/system/node_exporter.service <<'EOF'
 [Unit]
@@ -128,35 +127,33 @@ WantedBy=multi-user.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable --now node_exporter.service
-  log "node_exporter 已启动并设置开机自启（端口 9100）"
+  systemctl enable --now node_exporter.service >/dev/null
+
+  ok "node_exporter 已安装并启动（监听 9100）"
 }
 
 install_blackbox_exporter() {
-  local project="prometheus/blackbox_exporter"
-  local tag version url tmpdir
+  local tag version url prefix
 
-  tag="$(github_latest_tag "${project}")"
+  tag="$(github_latest_tag "prometheus/blackbox_exporter")"
+  [[ -n "${tag}" ]] || { err "获取 blackbox_exporter tag 失败"; exit 1; }
   version="${tag#v}"
   url="https://github.com/prometheus/blackbox_exporter/releases/download/${tag}/blackbox_exporter-${version}.linux-${ARCH}.tar.gz"
+  prefix="blackbox_exporter-${version}.linux-${ARCH}"
 
-  log "Blackbox Exporter 最新版本: ${tag}"
+  ok "Blackbox Exporter 最新版本: ${tag}"
 
-  # 端口占用检测（如果已经是 blackbox_exporter 占用也没关系，这里只做提醒）
-  if port_in_use 9115; then
-    warn "检测到 9115 端口已被占用（如果是已有 blackbox_exporter 在跑，可忽略）"
+  # 如果 9115 被占用但服务未在跑，直接报错（避免误覆盖）
+  if port_listening 9115 && ! service_active blackbox-exporter.service; then
+    err "端口 9115 已被占用，且 blackbox-exporter.service 未运行。请先释放端口再执行。"
+    exit 1
   fi
 
-  tmpdir="$(mktemp -d)"
-  wget -qO "${tmpdir}/blackbox_exporter.tar.gz" "${url}"
-  tar -xzf "${tmpdir}/blackbox_exporter.tar.gz" -C "${tmpdir}"
+  download_and_install_binary "${url}" "${prefix}" "blackbox_exporter" "/usr/local/bin/blackbox_exporter"
 
   mkdir -p /etc/blackbox_exporter
-  install -m 0755 "${tmpdir}/blackbox_exporter-"*/blackbox_exporter /usr/local/bin/blackbox_exporter
 
-  rm -rf "${tmpdir}"
-
-  # 写入 blackbox.yml（含 tcp_connect）
+  # 写入配置：启用 tcp_connect（你说的 tcping）
   cat > /etc/blackbox_exporter/blackbox.yml <<'EOF'
 modules:
   icmp:
@@ -196,116 +193,79 @@ WantedBy=multi-user.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable --now blackbox-exporter.service
-  log "blackbox_exporter 已启动并设置开机自启（端口 9115，已开启 tcp_connect 模块）"
+  systemctl enable --now blackbox-exporter.service >/dev/null
+  systemctl restart blackbox-exporter.service >/dev/null
+
+  ok "blackbox_exporter 已安装并启动（监听 9115，已开启 tcp_connect）"
 }
 
 prompt_panel_ip() {
   local ip=""
   while true; do
-    read -r -p "请输入面板服务器 IP（将仅允许该 IP 访问 9100/9115）: " ip
+    read -r -p "请输入面板服务器 IP（仅允许该 IP 访问 9100/9115）: " ip
     ip="${ip// /}"
-    if [[ -z "${ip}" ]]; then
-      warn "IP 不能为空"
-      continue
-    fi
-    # 简单校验 IPv4
+    [[ -n "${ip}" ]] || { warn "IP 不能为空"; continue; }
     if [[ "${ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
       PANEL_IP="${ip}"
       break
     else
-      warn "IP 格式看起来不对，请重新输入（例如 1.2.3.4）"
+      warn "IP 格式不正确，请输入类似 1.2.3.4"
     fi
   done
 }
 
-apply_firewall_rules() {
-  # 仅放行面板机访问 9100/9115（INPUT 链）
-  # 为避免重复插入，用 -C 检查，不存在再插入
+iptables_allow_panel() {
   local ip="${PANEL_IP}"
 
   for port in 9100 9115; do
     if iptables -C INPUT -p tcp -s "${ip}" --dport "${port}" -j ACCEPT >/dev/null 2>&1; then
-      log "iptables 规则已存在：允许 ${ip} -> ${port}"
+      ok "iptables 已存在规则：允许 ${ip} -> ${port}"
     else
       iptables -I INPUT -p tcp -s "${ip}" --dport "${port}" -j ACCEPT
-      log "已添加 iptables 规则：允许 ${ip} -> ${port}"
+      ok "iptables 已添加规则：允许 ${ip} -> ${port}"
     fi
   done
 
   netfilter-persistent save >/dev/null 2>&1 || true
   netfilter-persistent reload >/dev/null 2>&1 || true
 
-  log "已保存并重载 netfilter-persistent"
+  ok "已保存并重载 netfilter-persistent"
   echo
-  echo "当前 rules.v4："
+  echo "==== /etc/iptables/rules.v4 ===="
   cat /etc/iptables/rules.v4 || true
+  echo "==============================="
 }
 
-check_services() {
-  local ok_all=1
+check_all() {
+  local fail=0
 
   echo
-  echo "========== 安装结果检查 =========="
+  echo "========== 最终检查 =========="
 
   # node_exporter
-  if command -v node_exporter >/dev/null 2>&1; then
-    log "node_exporter 二进制存在：/usr/local/bin/node_exporter"
-  else
-    err "node_exporter 二进制不存在"
-    ok_all=0
-  fi
-
-  if systemctl is-active --quiet node_exporter.service; then
-    log "node_exporter 服务运行中"
-  else
-    err "node_exporter 服务未运行"
-    ok_all=0
-  fi
-
-  if ss -tuln | grep -q ":9100\b"; then
-    log "node_exporter 端口 9100 正在监听"
-  else
-    err "未检测到 9100 监听"
-    ok_all=0
-  fi
+  if [[ -x /usr/local/bin/node_exporter ]]; then ok "node_exporter 二进制 OK"; else err "node_exporter 二进制缺失"; fail=1; fi
+  if service_active node_exporter.service; then ok "node_exporter 服务运行 OK"; else err "node_exporter 服务未运行"; fail=1; fi
+  if port_listening 9100; then ok "9100 监听 OK"; else err "9100 未监听"; fail=1; fi
 
   # blackbox_exporter
-  if command -v blackbox_exporter >/dev/null 2>&1; then
-    log "blackbox_exporter 二进制存在：/usr/local/bin/blackbox_exporter"
+  if [[ -x /usr/local/bin/blackbox_exporter ]]; then ok "blackbox_exporter 二进制 OK"; else err "blackbox_exporter 二进制缺失"; fail=1; fi
+  if service_active blackbox-exporter.service; then ok "blackbox-exporter 服务运行 OK"; else err "blackbox-exporter 服务未运行"; fail=1; fi
+  if port_listening 9115; then ok "9115 监听 OK"; else err "9115 未监听"; fail=1; fi
+
+  # tcp_connect 模块检查
+  if [[ -f /etc/blackbox_exporter/blackbox.yml ]] && grep -q "^  tcp_connect:" /etc/blackbox_exporter/blackbox.yml; then
+    ok "tcp_connect（tcping）模块已开启 OK"
   else
-    err "blackbox_exporter 二进制不存在"
-    ok_all=0
+    err "tcp_connect 模块未开启"
+    fail=1
   fi
 
-  if systemctl is-active --quiet blackbox-exporter.service; then
-    log "blackbox-exporter 服务运行中"
-  else
-    err "blackbox-exporter 服务未运行"
-    ok_all=0
-  fi
+  echo "=============================="
 
-  if ss -tuln | grep -q ":9115\b"; then
-    log "blackbox-exporter 端口 9115 正在监听"
+  if [[ "${fail}" -eq 0 ]]; then
+    ok "全部成功 ✅"
   else
-    err "未检测到 9115 监听"
-    ok_all=0
-  fi
-
-  # tcp “ping” 模块检查（tcp_connect）
-  if [[ -f /etc/blackbox_exporter/blackbox.yml ]] && grep -q "tcp_connect" /etc/blackbox_exporter/blackbox.yml; then
-    log "tcp 探测模块已开启（blackbox.yml 中存在 tcp_connect）"
-  else
-    err "未检测到 tcp_connect 模块配置"
-    ok_all=0
-  fi
-
-  echo "================================="
-
-  if [[ "${ok_all}" -eq 1 ]]; then
-    echo -e "${GREEN}全部检查通过 ✅${NC}"
-  else
-    echo -e "${RED}存在失败项 ❌（请根据上面提示排查）${NC}"
+    err "存在失败项 ❌（请按上面提示排查）"
     exit 1
   fi
 }
@@ -313,16 +273,16 @@ check_services() {
 main() {
   require_root
   detect_arch
-  install_pkgs_if_needed
+  ensure_base_tools
   ensure_firewall_tools
 
   install_node_exporter
   install_blackbox_exporter
 
   prompt_panel_ip
-  apply_firewall_rules
+  iptables_allow_panel
 
-  check_services
+  check_all
 }
 
 main "$@"
