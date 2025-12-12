@@ -11,10 +11,10 @@ export DEBIAN_FRONTEND=noninteractive
 
 # ---------- Pretty output ----------
 RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"; BLUE="\033[34m"; NC="\033[0m"
-log()  { echo -e "${BLUE}[*]${NC} $*"; }
-ok()   { echo -e "${GREEN}[OK]${NC} $*"; }
-warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
-fail() { echo -e "${RED}[FAIL]${NC} $*"; }
+log()  { echo -e "${BLUE}[*]${NC} $*" >&2; }
+ok()   { echo -e "${GREEN}[OK]${NC} $*" >&2; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $*" >&2; }
+fail() { echo -e "${RED}[FAIL]${NC} $*" >&2; }
 
 on_error() {
   local exit_code=$?
@@ -73,11 +73,6 @@ apt_install_if_missing() {
   fi
 }
 
-curl_get() {
-  # $1=url
-  curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 2 "$1"
-}
-
 github_latest_tag_api() {
   # $1 = owner/repo
   # may fail due to rate limit; return empty if failed
@@ -101,12 +96,12 @@ github_latest_tag() {
   local tag=""
   tag="$(github_latest_tag_api "$repo")"
   if [[ -n "$tag" ]]; then
-    echo "$tag"
+    printf '%s\n' "$tag"
     return 0
   fi
   warn "GitHub API 获取 $repo 最新版本失败，尝试 fallback（解析 releases 页面）"
   tag="$(github_latest_tag_fallback "$repo")"
-  echo "$tag"
+  printf '%s\n' "$tag"
 }
 
 download_and_extract_tar_gz() {
@@ -116,7 +111,7 @@ download_and_extract_tar_gz() {
   log "下载：$url"
   curl -fL --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 2 "$url" -o "$TMP_BASE/pkg.tar.gz"
   tar -xzf "$TMP_BASE/pkg.tar.gz" -C "$TMP_BASE"
-  echo "$TMP_BASE"
+  printf '%s\n' "$TMP_BASE"
 }
 
 ensure_user() {
@@ -158,7 +153,7 @@ show_journal_hint() {
 # ---------- Pre-flight ----------
 log "系统信息：OS=${OS_ID} ${OS_VER} | ARCH=${ARCH}"
 
-# iproute2 provides ss; conntrack improves iptables match reliability; systemd required for systemctl
+# iproute2 provides ss; conntrack improves iptables match reliability
 apt_install_if_missing ca-certificates curl wget tar gzip gnupg lsb-release apt-transport-https software-properties-common iproute2 conntrack
 
 # =========================
@@ -194,7 +189,7 @@ install_prometheus() {
   local extracted
   extracted="$(find "$tmpdir" -maxdepth 1 -type d -name "prometheus-*" | head -n1)"
   if [[ -z "$extracted" ]]; then
-    fail "Prometheus 解压目录未找到"
+    fail "Prometheus 解压目录未找到（tmpdir=$tmpdir）"
     exit 1
   fi
 
@@ -298,7 +293,7 @@ install_node_exporter() {
   local extracted
   extracted="$(find "$tmpdir" -maxdepth 1 -type d -name "node_exporter-*" | head -n1)"
   if [[ -z "$extracted" ]]; then
-    fail "Node Exporter 解压目录未找到"
+    fail "Node Exporter 解压目录未找到（tmpdir=$tmpdir）"
     exit 1
   fi
 
@@ -362,7 +357,7 @@ install_blackbox_exporter() {
   local extracted
   extracted="$(find "$tmpdir" -maxdepth 1 -type d -name "blackbox_exporter-*" | head -n1)"
   if [[ -z "$extracted" ]]; then
-    fail "Blackbox Exporter 解压目录未找到"
+    fail "Blackbox Exporter 解压目录未找到（tmpdir=$tmpdir）"
     exit 1
   fi
 
@@ -471,12 +466,12 @@ apply_firewall_lock() {
     iptables -X
   fi
 
-  # 基础放行（若已存在，重复加不会报错但会多条；你也可以按需自己精简）
+  # 基础放行
   iptables -C INPUT -i lo -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -i lo -j ACCEPT
   iptables -C INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || iptables -I INPUT 2 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
   iptables -C INPUT -p tcp --dport 22 -j ACCEPT 2>/dev/null || iptables -I INPUT 3 -p tcp --dport 22 -j ACCEPT
 
-  # 锁端口：先允许本机，再 DROP 外部（用 -I 提升优先级）
+  # 锁端口：先允许本机，再 DROP 外部
   iptables -C INPUT -p tcp -s 127.0.0.1 --dport "${PROM_PORT}" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp -s 127.0.0.1 --dport "${PROM_PORT}" -j ACCEPT
   iptables -C INPUT -p tcp --dport "${PROM_PORT}" -j DROP 2>/dev/null || iptables -A INPUT -p tcp --dport "${PROM_PORT}" -j DROP
 
