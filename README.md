@@ -8,15 +8,3 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Jaydooooooo/grafana/main/ins
 curl -fsSL https://raw.githubusercontent.com/Jaydooooooo/grafana/main/grafana_install.sh | bash
 
 
-
-
-
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Jaydooooooo/grafana/main/install_exporters.sh)
-
-
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/Jaydooooooo/grafana/main/grafana_install.sh | bash
-
