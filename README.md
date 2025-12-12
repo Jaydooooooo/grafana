@@ -1,3 +1,7 @@
+如果您不知道如何使用或者想要使用，可以
+[联系我](https://t.me/tel_with_maizi_bot)
+
+
 被控机安装脚本，使用方法【复制安装】
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/Jaydooooooo/grafana/main/install_exporters.sh)
