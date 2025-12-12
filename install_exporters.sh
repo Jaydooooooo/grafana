@@ -61,7 +61,6 @@ ensure_firewall_tools() {
 }
 
 github_latest_tag() {
-  # 先拿到完整返回，再解析 tag；拿不到则输出 message，方便排障
   local repo="$1"
   local resp tag msg
 
@@ -70,10 +69,10 @@ github_latest_tag() {
     -H "User-Agent: install_exporters" \
     "https://api.github.com/repos/${repo}/releases/latest" || true)"
 
-  tag="$(printf '%s' "${resp}" | awk -F'"' '/"tag_name"[[:space:]]*:[[:space:]]*"/ {print $4; exit}')"
+  tag="$(printf '%s' "${resp}" | sed -n 's/.*"tag_name":"\([^"]*\)".*/\1/p' | head -n1)"
 
   if [[ -z "${tag}" ]]; then
-    msg="$(printf '%s' "${resp}" | awk -F'"' '/"message"[[:space:]]*:[[:space:]]*"/ {print $4; exit}')"
+    msg="$(printf '%s' "${resp}" | sed -n 's/.*"message":"\([^"]*\)".*/\1/p' | head -n1)"
     err "无法获取 ${repo} 最新版本 tag_name"
     [[ -n "${msg}" ]] && err "GitHub 返回: ${msg}"
     return 1
@@ -81,6 +80,7 @@ github_latest_tag() {
 
   echo "${tag}"
 }
+
 
 ensure_user() {
   local u="$1"
