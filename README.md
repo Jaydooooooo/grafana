@@ -15,5 +15,8 @@ curl -fsSL https://raw.githubusercontent.com/Jaydooooooo/grafana/main/grafana_in
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/Jaydooooooo/grafana/main/install_exporters.sh)
 
+
+
+```bash
 curl -fsSL https://raw.githubusercontent.com/Jaydooooooo/grafana/main/grafana_install.sh | bash
 
