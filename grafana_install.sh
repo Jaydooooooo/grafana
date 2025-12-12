@@ -205,6 +205,20 @@ wait_for_port() {
   return 1
 }
 
+get_public_ip() {
+  local ip=""
+  ip="$(curl -fsS --max-time 3 https://api.ipify.org 2>/dev/null || true)"
+  [[ -n "$ip" ]] && { echo "$ip"; return 0; }
+
+  ip="$(curl -fsS --max-time 3 https://ifconfig.me/ip 2>/dev/null || true)"
+  [[ -n "$ip" ]] && { echo "$ip"; return 0; }
+
+  ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
+  [[ -n "$ip" ]] && { echo "$ip"; return 0; }
+
+  hostname -I 2>/dev/null | awk '{print $1}' || echo "127.0.0.1"
+}
+
 # ---------- Pre-flight ----------
 log "系统信息：OS=${OS_ID} ${OS_VER} | ARCH=${ARCH}"
 apt_install_if_missing ca-certificates curl wget tar gzip gnupg lsb-release apt-transport-https software-properties-common iproute2 conntrack
@@ -411,15 +425,13 @@ EOF
 }
 
 # =========================
-# 4) Grafana (FIXED)
+# 4) Grafana
 # =========================
 install_grafana() {
   log "开始安装 Grafana（官方 APT 仓库）"
 
-  # Ensure deps for key handling
   apt_install_if_missing ca-certificates curl gnupg
 
-  # Keyring (binary .gpg)
   install -d -m 0755 /etc/apt/keyrings
   if [[ ! -f /etc/apt/keyrings/grafana.gpg ]]; then
     log "写入 Grafana keyring（dearmor）"
@@ -429,7 +441,6 @@ install_grafana() {
     ok "Grafana keyring 已存在"
   fi
 
-  # Repo
   if [[ ! -f /etc/apt/sources.list.d/grafana.list ]]; then
     log "添加 Grafana apt 源"
     echo "deb [signed-by=/etc/apt/keyrings/grafana.gpg] https://apt.grafana.com stable main" > /etc/apt/sources.list.d/grafana.list
@@ -437,13 +448,11 @@ install_grafana() {
     ok "Grafana apt 源已存在"
   fi
 
-  # IMPORTANT: refresh index AFTER adding repo (do not rely on apt_update_once)
   wait_for_apt_locks
   log "刷新 apt 索引（包含 Grafana 新源）"
   apt-get update -y
   apt_updated=1
 
-  # Install package (grafana or grafana-enterprise)
   log "尝试安装 grafana（若找不到则尝试 grafana-enterprise）"
   if ! apt-get install -y grafana; then
     warn "未找到 grafana 包，尝试安装 grafana-enterprise"
@@ -552,6 +561,9 @@ final_checks() {
   fi
   http_ok "http://127.0.0.1:${GRAF_PORT}/api/health" && ok "Grafana health ✅" || warn "Grafana health 仍不可用（建议看日志：journalctl -u grafana-server -n 200 --no-pager）"
 
+  local host_ip
+  host_ip="$(get_public_ip)"
+
   echo >&2
   echo "==========================================" >&2
   if [[ "$all_ok" -eq 1 ]]; then
@@ -560,7 +572,7 @@ final_checks() {
     echo -e "${RED}⚠️ 安装完成但存在检查失败项，请按上面 FAIL 提示排查${NC}" >&2
   fi
   echo "Prometheus(本机): http://127.0.0.1:${PROM_PORT}" >&2
-  echo "Grafana(外网):    http://<你的VPS公网IP>:${GRAF_PORT}" >&2
+  echo "Grafana(外网):    http://${host_ip}:${GRAF_PORT}" >&2
   echo "==========================================" >&2
 }
 
