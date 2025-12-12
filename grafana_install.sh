@@ -27,9 +27,9 @@ trap on_error ERR
 
 # ---------- Must be root ----------
 if [[ "${EUID}" -ne 0 ]]; then
-  fail "请用 root 运行（不要 sudo 写进命令里，直接切 root 执行即可）："
+  fail "请用 root 运行："
   echo "  su -"
-  echo "  ./install.sh"
+  echo "  ./grafana_install.sh"
   exit 1
 fi
 
@@ -38,7 +38,8 @@ ARCH="$(uname -m)"
 OS_ID="$(. /etc/os-release && echo "${ID:-unknown}")"
 OS_VER="$(. /etc/os-release && echo "${VERSION_ID:-unknown}")"
 
-SETUP_FIREWALL="${SETUP_FIREWALL:-1}"   # 1=apply iptables rules, 0=skip
+SETUP_FIREWALL="${SETUP_FIREWALL:-1}"     # 1=apply iptables rules, 0=skip
+FIREWALL_FLUSH="${FIREWALL_FLUSH:-0}"     # 1=flush old rules (DANGEROUS), 0=do not flush
 PROM_USER="prometheus"
 INSTALL_DIR="/usr/local/bin"
 ETC_DIR="/etc"
@@ -48,6 +49,10 @@ PROM_PORT=9090
 NODE_PORT=9100
 BB_PORT=9115
 GRAF_PORT=3000
+
+TMP_BASE="/tmp/monitoring-stack.$$"
+cleanup() { rm -rf "$TMP_BASE" >/dev/null 2>&1 || true; }
+trap cleanup EXIT
 
 # ---------- Helpers ----------
 need_cmd() { command -v "$1" >/dev/null 2>&1; }
@@ -68,21 +73,50 @@ apt_install_if_missing() {
   fi
 }
 
-github_latest_tag() {
+curl_get() {
+  # $1=url
+  curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 2 "$1"
+}
+
+github_latest_tag_api() {
   # $1 = owner/repo
-  curl -fsSL "https://api.github.com/repos/$1/releases/latest" | grep -m1 '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/'
+  # may fail due to rate limit; return empty if failed
+  curl -fsSL --connect-timeout 10 --max-time 20 "https://api.github.com/repos/$1/releases/latest" 2>/dev/null \
+    | grep -m1 '"tag_name":' \
+    | sed -E 's/.*"([^"]+)".*/\1/' || true
+}
+
+github_latest_tag_fallback() {
+  # Fallback: parse releases "latest" redirect page
+  # $1 = owner/repo
+  # Extract vX.Y.Z from HTML
+  curl -fsSL --connect-timeout 10 --max-time 30 "https://github.com/$1/releases/latest" 2>/dev/null \
+    | grep -Eo 'tag/v[0-9]+\.[0-9]+\.[0-9]+' \
+    | head -n1 \
+    | sed 's/tag\///' || true
+}
+
+github_latest_tag() {
+  local repo="$1"
+  local tag=""
+  tag="$(github_latest_tag_api "$repo")"
+  if [[ -n "$tag" ]]; then
+    echo "$tag"
+    return 0
+  fi
+  warn "GitHub API 获取 $repo 最新版本失败，尝试 fallback（解析 releases 页面）"
+  tag="$(github_latest_tag_fallback "$repo")"
+  echo "$tag"
 }
 
 download_and_extract_tar_gz() {
-  # $1=url $2=dest_dir
+  # $1=url
   local url="$1"
-  local dest="$2"
-  local tmp="/tmp/monitoring-stack.$$"
-  mkdir -p "$tmp" "$dest"
+  mkdir -p "$TMP_BASE"
   log "下载：$url"
-  curl -fL "$url" -o "$tmp/pkg.tar.gz"
-  tar -xzf "$tmp/pkg.tar.gz" -C "$tmp"
-  echo "$tmp"
+  curl -fL --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 2 "$url" -o "$TMP_BASE/pkg.tar.gz"
+  tar -xzf "$TMP_BASE/pkg.tar.gz" -C "$TMP_BASE"
+  echo "$TMP_BASE"
 }
 
 ensure_user() {
@@ -113,12 +147,19 @@ port_listening() {
 
 http_ok() {
   local url="$1"
-  curl -fsS --max-time 3 "$url" >/dev/null 2>&1
+  curl -fsS --max-time 5 "$url" >/dev/null 2>&1
+}
+
+show_journal_hint() {
+  local svc="$1"
+  echo "  journalctl -u $svc --no-pager -n 200"
 }
 
 # ---------- Pre-flight ----------
 log "系统信息：OS=${OS_ID} ${OS_VER} | ARCH=${ARCH}"
-apt_install_if_missing ca-certificates curl wget tar gzip gnupg lsb-release apt-transport-https software-properties-common
+
+# iproute2 provides ss; conntrack improves iptables match reliability; systemd required for systemctl
+apt_install_if_missing ca-certificates curl wget tar gzip gnupg lsb-release apt-transport-https software-properties-common iproute2 conntrack
 
 # =========================
 # 1) Install Prometheus
@@ -133,7 +174,7 @@ install_prometheus() {
   local tag
   tag="$(github_latest_tag "prometheus/prometheus")"
   if [[ -z "$tag" ]]; then
-    fail "无法获取 Prometheus 最新版本（GitHub API）。"
+    fail "无法获取 Prometheus 最新版本（GitHub API / fallback 都失败）。"
     exit 1
   fi
   local ver="${tag#v}"
@@ -148,7 +189,7 @@ install_prometheus() {
 
   local url="https://github.com/prometheus/prometheus/releases/download/${tag}/prometheus-${ver}.${pkg_arch}.tar.gz"
   local tmpdir
-  tmpdir="$(download_and_extract_tar_gz "$url" "/tmp")"
+  tmpdir="$(download_and_extract_tar_gz "$url")"
 
   local extracted
   extracted="$(find "$tmpdir" -maxdepth 1 -type d -name "prometheus-*" | head -n1)"
@@ -162,7 +203,6 @@ install_prometheus() {
   cp -r "$extracted/consoles" "$ETC_DIR/prometheus/" || true
   cp -r "$extracted/console_libraries" "$ETC_DIR/prometheus/" || true
 
-  # Default config (minimal + includes node & blackbox jobs)
   cat > "$ETC_DIR/prometheus/prometheus.yml" <<'YAML'
 global:
   scrape_interval: 15s
@@ -223,7 +263,8 @@ EOF
   if svc_is_active prometheus.service; then
     ok "Prometheus 服务已启动"
   else
-    fail "Prometheus 服务未启动（请看：journalctl -u prometheus --no-pager -n 200）"
+    fail "Prometheus 服务未启动，请查看："
+    show_journal_hint prometheus
     exit 1
   fi
 }
@@ -237,7 +278,7 @@ install_node_exporter() {
   local tag
   tag="$(github_latest_tag "prometheus/node_exporter")"
   if [[ -z "$tag" ]]; then
-    fail "无法获取 Node Exporter 最新版本（GitHub API）。"
+    fail "无法获取 Node Exporter 最新版本（GitHub API / fallback 都失败）。"
     exit 1
   fi
   local ver="${tag#v}"
@@ -252,7 +293,7 @@ install_node_exporter() {
 
   local url="https://github.com/prometheus/node_exporter/releases/download/${tag}/node_exporter-${ver}.${pkg_arch}.tar.gz"
   local tmpdir
-  tmpdir="$(download_and_extract_tar_gz "$url" "/tmp")"
+  tmpdir="$(download_and_extract_tar_gz "$url")"
 
   local extracted
   extracted="$(find "$tmpdir" -maxdepth 1 -type d -name "node_exporter-*" | head -n1)"
@@ -286,7 +327,8 @@ EOF
   if svc_is_active node_exporter.service; then
     ok "Node Exporter 服务已启动"
   else
-    fail "Node Exporter 服务未启动（journalctl -u node_exporter --no-pager -n 200）"
+    fail "Node Exporter 服务未启动，请查看："
+    show_journal_hint node_exporter
     exit 1
   fi
 }
@@ -300,7 +342,7 @@ install_blackbox_exporter() {
   local tag
   tag="$(github_latest_tag "prometheus/blackbox_exporter")"
   if [[ -z "$tag" ]]; then
-    fail "无法获取 Blackbox Exporter 最新版本（GitHub API）。"
+    fail "无法获取 Blackbox Exporter 最新版本（GitHub API / fallback 都失败）。"
     exit 1
   fi
   local ver="${tag#v}"
@@ -315,7 +357,7 @@ install_blackbox_exporter() {
 
   local url="https://github.com/prometheus/blackbox_exporter/releases/download/${tag}/blackbox_exporter-${ver}.${pkg_arch}.tar.gz"
   local tmpdir
-  tmpdir="$(download_and_extract_tar_gz "$url" "/tmp")"
+  tmpdir="$(download_and_extract_tar_gz "$url")"
 
   local extracted
   extracted="$(find "$tmpdir" -maxdepth 1 -type d -name "blackbox_exporter-*" | head -n1)"
@@ -363,7 +405,8 @@ EOF
   if svc_is_active blackbox_exporter.service; then
     ok "Blackbox Exporter 服务已启动"
   else
-    fail "Blackbox Exporter 服务未启动（journalctl -u blackbox_exporter --no-pager -n 200）"
+    fail "Blackbox Exporter 服务未启动，请查看："
+    show_journal_hint blackbox_exporter
     exit 1
   fi
 }
@@ -374,8 +417,8 @@ EOF
 install_grafana() {
   log "开始安装 Grafana（官方 APT 仓库）"
 
-  # Keyring
   mkdir -p /usr/share/keyrings
+
   if [[ ! -f /usr/share/keyrings/grafana.key ]]; then
     log "写入 Grafana keyring"
     wget -q -O /usr/share/keyrings/grafana.key https://apt.grafana.com/gpg.key
@@ -383,7 +426,6 @@ install_grafana() {
     ok "Grafana keyring 已存在"
   fi
 
-  # Repo
   if [[ ! -f /etc/apt/sources.list.d/grafana.list ]]; then
     log "添加 Grafana apt 源"
     echo "deb [signed-by=/usr/share/keyrings/grafana.key] https://apt.grafana.com stable main" > /etc/apt/sources.list.d/grafana.list
@@ -399,7 +441,8 @@ install_grafana() {
   if svc_is_active grafana-server.service; then
     ok "Grafana 服务已启动"
   else
-    fail "Grafana 服务未启动（journalctl -u grafana-server --no-pager -n 200）"
+    fail "Grafana 服务未启动，请查看："
+    show_journal_hint grafana-server
     exit 1
   fi
 }
@@ -414,34 +457,37 @@ apply_firewall_lock() {
   fi
 
   log "开始配置 iptables：锁定 Prometheus/Grafana/Exporter 端口只允许 127.0.0.1"
+  warn "提示：默认不会清空旧规则（更安全）。如需清空旧规则请加：FIREWALL_FLUSH=1"
 
-  apt_install_if_missing iptables iptables-persistent
+  apt_install_if_missing iptables iptables-persistent conntrack
 
   local backup="/root/iptables-backup-$(date +%Y%m%d-%H%M%S).rules"
   iptables-save > "$backup"
   ok "已备份当前规则：$backup"
 
-  # 清空旧规则（与你原脚本一致，风险：会影响你原有防火墙策略）
-  iptables -F
-  iptables -X
+  if [[ "$FIREWALL_FLUSH" == "1" ]]; then
+    warn "你启用了 FIREWALL_FLUSH=1：将清空现有 iptables 规则（有 SSH 断连风险）"
+    iptables -F
+    iptables -X
+  fi
 
-  # 基础放行
-  iptables -A INPUT -i lo -j ACCEPT
-  iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-  iptables -A INPUT -p tcp --dport 22 -j ACCEPT
+  # 基础放行（若已存在，重复加不会报错但会多条；你也可以按需自己精简）
+  iptables -C INPUT -i lo -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -i lo -j ACCEPT
+  iptables -C INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || iptables -I INPUT 2 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  iptables -C INPUT -p tcp --dport 22 -j ACCEPT 2>/dev/null || iptables -I INPUT 3 -p tcp --dport 22 -j ACCEPT
 
-  # 锁端口：先允许本机，再 DROP 外部
-  iptables -A INPUT -p tcp -s 127.0.0.1 --dport "${PROM_PORT}" -j ACCEPT
-  iptables -A INPUT -p tcp --dport "${PROM_PORT}" -j DROP
+  # 锁端口：先允许本机，再 DROP 外部（用 -I 提升优先级）
+  iptables -C INPUT -p tcp -s 127.0.0.1 --dport "${PROM_PORT}" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp -s 127.0.0.1 --dport "${PROM_PORT}" -j ACCEPT
+  iptables -C INPUT -p tcp --dport "${PROM_PORT}" -j DROP 2>/dev/null || iptables -A INPUT -p tcp --dport "${PROM_PORT}" -j DROP
 
-  iptables -A INPUT -p tcp -s 127.0.0.1 --dport "${GRAF_PORT}" -j ACCEPT
-  iptables -A INPUT -p tcp --dport "${GRAF_PORT}" -j DROP
+  iptables -C INPUT -p tcp -s 127.0.0.1 --dport "${GRAF_PORT}" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp -s 127.0.0.1 --dport "${GRAF_PORT}" -j ACCEPT
+  iptables -C INPUT -p tcp --dport "${GRAF_PORT}" -j DROP 2>/dev/null || iptables -A INPUT -p tcp --dport "${GRAF_PORT}" -j DROP
 
-  iptables -A INPUT -p tcp -s 127.0.0.1 --dport "${NODE_PORT}" -j ACCEPT
-  iptables -A INPUT -p tcp --dport "${NODE_PORT}" -j DROP
+  iptables -C INPUT -p tcp -s 127.0.0.1 --dport "${NODE_PORT}" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp -s 127.0.0.1 --dport "${NODE_PORT}" -j ACCEPT
+  iptables -C INPUT -p tcp --dport "${NODE_PORT}" -j DROP 2>/dev/null || iptables -A INPUT -p tcp --dport "${NODE_PORT}" -j DROP
 
-  iptables -A INPUT -p tcp -s 127.0.0.1 --dport "${BB_PORT}" -j ACCEPT
-  iptables -A INPUT -p tcp --dport "${BB_PORT}" -j DROP
+  iptables -C INPUT -p tcp -s 127.0.0.1 --dport "${BB_PORT}" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp -s 127.0.0.1 --dport "${BB_PORT}" -j ACCEPT
+  iptables -C INPUT -p tcp --dport "${BB_PORT}" -j DROP 2>/dev/null || iptables -A INPUT -p tcp --dport "${BB_PORT}" -j DROP
 
   # 持久化
   iptables-save > /etc/iptables/rules.v4
@@ -467,6 +513,7 @@ final_checks() {
       ok "服务运行中：$svc"
     else
       fail "服务未运行：$svc"
+      show_journal_hint "${svc%.service}"
       all_ok=0
     fi
   done
@@ -475,7 +522,7 @@ final_checks() {
     if port_listening "$p"; then
       ok "端口监听正常：$p（本机）"
     else
-      fail "端口未监听：$p"
+      fail "端口未监听：$p（可能服务未起来或监听地址不同）"
       all_ok=0
     fi
   done
@@ -483,7 +530,7 @@ final_checks() {
   if http_ok "http://127.0.0.1:${PROM_PORT}/-/ready"; then ok "Prometheus ready ✅"; else fail "Prometheus ready 失败"; all_ok=0; fi
   if http_ok "http://127.0.0.1:${NODE_PORT}/metrics"; then ok "Node Exporter metrics ✅"; else fail "Node Exporter metrics 失败"; all_ok=0; fi
   if http_ok "http://127.0.0.1:${BB_PORT}/metrics"; then ok "Blackbox metrics ✅"; else fail "Blackbox metrics 失败"; all_ok=0; fi
-  if http_ok "http://127.0.0.1:${GRAF_PORT}/api/health"; then ok "Grafana health ✅"; else warn "Grafana health 检查失败（可能刚启动还没就绪）"; fi
+  if http_ok "http://127.0.0.1:${GRAF_PORT}/api/health"; then ok "Grafana health ✅"; else warn "Grafana health 检查失败（可能刚启动还没就绪，等 10 秒再试）"; fi
 
   echo
   echo "=========================================="
@@ -492,10 +539,14 @@ final_checks() {
   else
     echo -e "${RED}⚠️ 安装完成但存在检查失败项，请按上面 FAIL 提示排查${NC}"
   fi
+
   echo "Prometheus:  http://127.0.0.1:${PROM_PORT}"
   echo "Grafana:     http://127.0.0.1:${GRAF_PORT}"
   echo "NodeExp:     http://127.0.0.1:${NODE_PORT}/metrics"
   echo "Blackbox:    http://127.0.0.1:${BB_PORT}/metrics"
+  if [[ "$SETUP_FIREWALL" == "1" ]]; then
+    echo "防火墙：已锁端口（外网无法访问 3000/9090/9100/9115，如需外网访问请跳过防火墙或自行放行/反代）"
+  fi
   echo "=========================================="
 }
 
