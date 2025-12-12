@@ -42,6 +42,7 @@ ensure_base_tools() {
   need_cmd wget || pkgs+=("wget")
   need_cmd tar  || pkgs+=("tar")
   need_cmd ss   || pkgs+=("iproute2")
+
   if ((${#pkgs[@]})); then
     warn "安装基础依赖: ${pkgs[*]}"
     apt_install "${pkgs[@]}"
@@ -52,6 +53,7 @@ ensure_firewall_tools() {
   local pkgs=()
   need_cmd iptables || pkgs+=("iptables")
   need_cmd netfilter-persistent || pkgs+=("iptables-persistent" "netfilter-persistent")
+
   if ((${#pkgs[@]})); then
     warn "安装防火墙依赖: ${pkgs[*]}"
     apt_install "${pkgs[@]}"
@@ -59,17 +61,30 @@ ensure_firewall_tools() {
 }
 
 github_latest_tag() {
-  # 用 GitHub API 获取 latest release tag（修复 awk \s 不兼容问题）
+  # 先拿到完整返回，再解析 tag；拿不到则输出 message，方便排障
   local repo="$1"
-  curl -fsSL "https://api.github.com/repos/${repo}/releases/latest" \
-    | awk -F'"' '/"tag_name"[[:space:]]*:[[:space:]]*"/ {print $4; exit}'
+  local resp tag msg
+
+  resp="$(curl -sS -L \
+    -H "Accept: application/vnd.github+json" \
+    -H "User-Agent: install_exporters" \
+    "https://api.github.com/repos/${repo}/releases/latest" || true)"
+
+  tag="$(printf '%s' "${resp}" | awk -F'"' '/"tag_name"[[:space:]]*:[[:space:]]*"/ {print $4; exit}')"
+
+  if [[ -z "${tag}" ]]; then
+    msg="$(printf '%s' "${resp}" | awk -F'"' '/"message"[[:space:]]*:[[:space:]]*"/ {print $4; exit}')"
+    err "无法获取 ${repo} 最新版本 tag_name"
+    [[ -n "${msg}" ]] && err "GitHub 返回: ${msg}"
+    return 1
+  fi
+
+  echo "${tag}"
 }
 
 ensure_user() {
   local u="$1"
-  if ! id "$u" >/dev/null 2>&1; then
-    useradd -rs /bin/false "$u"
-  fi
+  id "$u" >/dev/null 2>&1 || useradd -rs /bin/false "$u"
 }
 
 port_listening() {
@@ -83,7 +98,6 @@ service_active() {
 }
 
 download_and_install_binary() {
-  # $1=url  $2=tar_prefix  $3=binary_name  $4=install_path
   local url="$1" prefix="$2" bin="$3" dst="$4"
   local tmp
   tmp="$(mktemp -d)"
@@ -95,9 +109,7 @@ download_and_install_binary() {
 
 install_node_exporter() {
   local tag version url prefix
-
-  tag="$(github_latest_tag "prometheus/node_exporter")"
-  [[ -n "${tag}" ]] || { err "获取 node_exporter tag 失败"; exit 1; }
+  tag="$(github_latest_tag "prometheus/node_exporter")" || { err "获取 node_exporter tag 失败"; exit 1; }
   version="${tag#v}"
   url="https://github.com/prometheus/node_exporter/releases/download/${tag}/node_exporter-${version}.linux-${ARCH}.tar.gz"
   prefix="node_exporter-${version}.linux-${ARCH}"
@@ -105,7 +117,6 @@ install_node_exporter() {
   ok "Node Exporter 最新版本: ${tag}"
 
   ensure_user "node_exporter"
-
   download_and_install_binary "${url}" "${prefix}" "node_exporter" "/usr/local/bin/node_exporter"
 
   cat > /etc/systemd/system/node_exporter.service <<'EOF'
@@ -128,22 +139,18 @@ EOF
 
   systemctl daemon-reload
   systemctl enable --now node_exporter.service >/dev/null
-
   ok "node_exporter 已安装并启动（监听 9100）"
 }
 
 install_blackbox_exporter() {
   local tag version url prefix
-
-  tag="$(github_latest_tag "prometheus/blackbox_exporter")"
-  [[ -n "${tag}" ]] || { err "获取 blackbox_exporter tag 失败"; exit 1; }
+  tag="$(github_latest_tag "prometheus/blackbox_exporter")" || { err "获取 blackbox_exporter tag 失败"; exit 1; }
   version="${tag#v}"
   url="https://github.com/prometheus/blackbox_exporter/releases/download/${tag}/blackbox_exporter-${version}.linux-${ARCH}.tar.gz"
   prefix="blackbox_exporter-${version}.linux-${ARCH}"
 
   ok "Blackbox Exporter 最新版本: ${tag}"
 
-  # 如果 9115 被占用但服务未在跑，直接报错（避免误覆盖）
   if port_listening 9115 && ! service_active blackbox-exporter.service; then
     err "端口 9115 已被占用，且 blackbox-exporter.service 未运行。请先释放端口再执行。"
     exit 1
@@ -152,8 +159,6 @@ install_blackbox_exporter() {
   download_and_install_binary "${url}" "${prefix}" "blackbox_exporter" "/usr/local/bin/blackbox_exporter"
 
   mkdir -p /etc/blackbox_exporter
-
-  # 写入配置：启用 tcp_connect（你说的 tcping）
   cat > /etc/blackbox_exporter/blackbox.yml <<'EOF'
 modules:
   icmp:
@@ -195,7 +200,6 @@ EOF
   systemctl daemon-reload
   systemctl enable --now blackbox-exporter.service >/dev/null
   systemctl restart blackbox-exporter.service >/dev/null
-
   ok "blackbox_exporter 已安装并启动（监听 9115，已开启 tcp_connect）"
 }
 
@@ -205,18 +209,14 @@ prompt_panel_ip() {
     read -r -p "请输入面板服务器 IP（仅允许该 IP 访问 9100/9115）: " ip
     ip="${ip// /}"
     [[ -n "${ip}" ]] || { warn "IP 不能为空"; continue; }
-    if [[ "${ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-      PANEL_IP="${ip}"
-      break
-    else
-      warn "IP 格式不正确，请输入类似 1.2.3.4"
-    fi
+    [[ "${ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || { warn "IP 格式不正确，请输入类似 1.2.3.4"; continue; }
+    PANEL_IP="${ip}"
+    break
   done
 }
 
 iptables_allow_panel() {
   local ip="${PANEL_IP}"
-
   for port in 9100 9115; do
     if iptables -C INPUT -p tcp -s "${ip}" --dport "${port}" -j ACCEPT >/dev/null 2>&1; then
       ok "iptables 已存在规则：允许 ${ip} -> ${port}"
@@ -238,27 +238,19 @@ iptables_allow_panel() {
 
 check_all() {
   local fail=0
-
   echo
   echo "========== 最终检查 =========="
 
-  # node_exporter
-  if [[ -x /usr/local/bin/node_exporter ]]; then ok "node_exporter 二进制 OK"; else err "node_exporter 二进制缺失"; fail=1; fi
-  if service_active node_exporter.service; then ok "node_exporter 服务运行 OK"; else err "node_exporter 服务未运行"; fail=1; fi
-  if port_listening 9100; then ok "9100 监听 OK"; else err "9100 未监听"; fail=1; fi
+  [[ -x /usr/local/bin/node_exporter ]] && ok "node_exporter 二进制 OK" || { err "node_exporter 二进制缺失"; fail=1; }
+  service_active node_exporter.service && ok "node_exporter 服务运行 OK" || { err "node_exporter 服务未运行"; fail=1; }
+  port_listening 9100 && ok "9100 监听 OK" || { err "9100 未监听"; fail=1; }
 
-  # blackbox_exporter
-  if [[ -x /usr/local/bin/blackbox_exporter ]]; then ok "blackbox_exporter 二进制 OK"; else err "blackbox_exporter 二进制缺失"; fail=1; fi
-  if service_active blackbox-exporter.service; then ok "blackbox-exporter 服务运行 OK"; else err "blackbox-exporter 服务未运行"; fail=1; fi
-  if port_listening 9115; then ok "9115 监听 OK"; else err "9115 未监听"; fail=1; fi
+  [[ -x /usr/local/bin/blackbox_exporter ]] && ok "blackbox_exporter 二进制 OK" || { err "blackbox_exporter 二进制缺失"; fail=1; }
+  service_active blackbox-exporter.service && ok "blackbox-exporter 服务运行 OK" || { err "blackbox-exporter 服务未运行"; fail=1; }
+  port_listening 9115 && ok "9115 监听 OK" || { err "9115 未监听"; fail=1; }
 
-  # tcp_connect 模块检查
-  if [[ -f /etc/blackbox_exporter/blackbox.yml ]] && grep -q "^  tcp_connect:" /etc/blackbox_exporter/blackbox.yml; then
-    ok "tcp_connect（tcping）模块已开启 OK"
-  else
-    err "tcp_connect 模块未开启"
-    fail=1
-  fi
+  [[ -f /etc/blackbox_exporter/blackbox.yml ]] && grep -q "^  tcp_connect:" /etc/blackbox_exporter/blackbox.yml \
+    && ok "tcp_connect（tcping）模块已开启 OK" || { err "tcp_connect 模块未开启"; fail=1; }
 
   echo "=============================="
 
