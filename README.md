@@ -19,9 +19,9 @@ systemctl restart prometheus
 ```bash
 22869
 ```
-[image](https://github.com/Jaydooooooo/images/blob/main/22869.png)
+![image](https://github.com/Jaydooooooo/images/blob/main/22869.png)
 【网络检测22500】
 ```bash
 22500
 ```
-[image](https://github.com/Jaydooooooo/images/blob/main/22500.png)
+![image](https://github.com/Jaydooooooo/images/blob/main/22500.png)
