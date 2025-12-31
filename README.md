@@ -2,6 +2,12 @@
 [联系我](https://t.me/tel_with_maizi_bot)
 
 
+修改防火墙的通过规则（手动）
+```bash
+curl -fsSL "https://raw.githubusercontent.com/Jaydooooooo/grafana/refs/heads/main/iptbales.sh" -o /tmp/iptbales.sh && chmod +x /tmp/iptbales.sh && /tmp/iptbales.sh
+```
+
+
 被控机安装脚本，使用方法【复制安装】
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/Jaydooooooo/grafana/main/install_exporters.sh)
