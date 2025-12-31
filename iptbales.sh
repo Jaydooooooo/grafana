@@ -21,8 +21,7 @@ require_root() {
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 ask_yes_no() {
-  local prompt="$1"
-  local ans
+  local prompt="$1" ans
   while true; do
     read -r -p "$prompt [y/n]: " ans
     case "${ans,,}" in
@@ -34,11 +33,9 @@ ask_yes_no() {
 }
 
 detect_os_family() {
-  # 输出：debian / rhel / other
   if [[ -f /etc/os-release ]]; then
     . /etc/os-release
-    local id_like="${ID_LIKE:-}"
-    local id="${ID:-}"
+    local id_like="${ID_LIKE:-}" id="${ID:-}"
     if echo "$id $id_like" | grep -qiE 'debian|ubuntu'; then
       echo "debian"; return
     fi
@@ -49,91 +46,102 @@ detect_os_family() {
   echo "other"
 }
 
-install_iptables_and_persist() {
-  local fam; fam="$(detect_os_family)"
+ensure_iptables_debian_persist() {
+  # Debian/Ubuntu：强制确保“安装 + 启用 + 可保存/可开机恢复”
+  if ! has_cmd apt-get; then
+    red "未找到 apt-get，无法按 Debian/Ubuntu 方式安装。"
+    exit 1
+  fi
 
-  yellow "检测到系统可能未安装 iptables，准备安装…"
-  if [[ "$fam" == "debian" ]]; then
-    if ! has_cmd apt-get; then
-      red "系统不是标准 Debian/Ubuntu（未找到 apt-get），请手动安装 iptables。"
-      exit 1
-    fi
-    yellow "将安装：iptables + iptables-persistent（用于持久化规则）"
-    if ask_yes_no "是否继续安装？"; then
+  if ! has_cmd iptables; then
+    yellow "未检测到 iptables，将安装 iptables..."
+  fi
+
+  # 关键：不管 iptables 在不在，都确保 iptables-persistent 在且服务启用
+  if ! dpkg -l 2>/dev/null | grep -qE '^ii\s+iptables-persistent\s'; then
+    yellow "将安装 iptables-persistent（用于重启后自动恢复规则）"
+    if ask_yes_no "是否安装 iptables + iptables-persistent？"; then
       apt-get update -y
       DEBIAN_FRONTEND=noninteractive apt-get install -y iptables iptables-persistent
-      green "安装完成。"
     else
-      red "用户取消安装，无法继续。"
+      red "用户取消安装持久化组件，重启后规则将无法保证生效，退出。"
       exit 1
     fi
-  elif [[ "$fam" == "rhel" ]]; then
-    if has_cmd dnf; then
-      yellow "将安装：iptables-services（用于持久化规则）"
-      if ask_yes_no "是否继续安装？"; then
-        dnf install -y iptables-services
-        systemctl enable --now iptables
-        green "安装并启用 iptables-services 完成。"
-      else
-        red "用户取消安装，无法继续。"
-        exit 1
-      fi
-    elif has_cmd yum; then
-      yellow "将安装：iptables-services（用于持久化规则）"
-      if ask_yes_no "是否继续安装？"; then
-        yum install -y iptables-services
-        systemctl enable --now iptables
-        green "安装并启用 iptables-services 完成。"
-      else
-        red "用户取消安装，无法继续。"
-        exit 1
-      fi
-    else
-      red "系统不是标准 RHEL 系（未找到 yum/dnf），请手动安装 iptables。"
-      exit 1
-    fi
-  else
-    red "无法识别发行版类型，请手动安装 iptables 并确保能持久化规则。"
+  fi
+
+  # 确保服务启用
+  systemctl enable --now netfilter-persistent >/dev/null 2>&1 || true
+
+  # 如果服务仍不可用，明确报错
+  if ! systemctl is-enabled netfilter-persistent >/dev/null 2>&1; then
+    red "netfilter-persistent 未启用（iptables-persistent 可能安装异常）。"
+    red "请执行：apt-get install -y iptables-persistent && systemctl enable --now netfilter-persistent"
     exit 1
   fi
 }
 
-valid_ip_or_cidr() {
-  # 支持：a.b.c.d 或 a.b.c.d/0-32
-  local s="$1"
-  # 基本格式
-  if [[ ! "$s" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/([0-9]|[12][0-9]|3[0-2]))?$ ]]; then
-    return 1
+install_iptables_and_persist_other() {
+  local fam; fam="$(detect_os_family)"
+  if [[ "$fam" == "debian" ]]; then
+    ensure_iptables_debian_persist
+    return 0
   fi
-  # 检查每段 <= 255
+
+  # 其它系统：尽量维持你之前逻辑（RHEL 用 iptables-services）
+  if [[ "$fam" == "rhel" ]]; then
+    if has_cmd dnf; then
+      yellow "将安装 iptables-services（用于持久化规则）"
+      if ask_yes_no "是否继续安装？"; then
+        dnf install -y iptables-services
+        systemctl enable --now iptables
+      else
+        red "用户取消安装，无法继续。"
+        exit 1
+      fi
+      return 0
+    fi
+    if has_cmd yum; then
+      yellow "将安装 iptables-services（用于持久化规则）"
+      if ask_yes_no "是否继续安装？"; then
+        yum install -y iptables-services
+        systemctl enable --now iptables
+      else
+        red "用户取消安装，无法继续。"
+        exit 1
+      fi
+      return 0
+    fi
+  fi
+
+  red "无法识别系统或缺少包管理器，请手动安装 iptables 与持久化组件。"
+  exit 1
+}
+
+valid_ip_or_cidr() {
+  local s="$1"
+  [[ "$s" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/([0-9]|[12][0-9]|3[0-2]))?$ ]] || return 1
   local ip="${s%%/*}"
   IFS='.' read -r o1 o2 o3 o4 <<<"$ip"
   for o in "$o1" "$o2" "$o3" "$o4"; do
-    if (( o < 0 || o > 255 )); then
-      return 1
-    fi
+    (( o >= 0 && o <= 255 )) || return 1
   done
   return 0
 }
 
 ensure_chain_and_hook() {
-  # 创建自定义链
-  if ! iptables -nL "$CHAIN" >/dev/null 2>&1; then
-    iptables -N "$CHAIN"
-  fi
+  iptables -nL "$CHAIN" >/dev/null 2>&1 || iptables -N "$CHAIN"
 
-  # 确保 INPUT 链中有 hook（放在最前面，优先匹配）
-  # hook规则：凡是访问 9100/9115 的 TCP 流量，都跳转到自定义链处理
+  # hook 放 INPUT 最前，确保优先匹配
   if ! iptables -C INPUT -p tcp -m multiport --dports ${PORTS} -j "$CHAIN" -m comment --comment "$HOOK_COMMENT" >/dev/null 2>&1; then
     iptables -I INPUT 1 -p tcp -m multiport --dports ${PORTS} -j "$CHAIN" -m comment --comment "$HOOK_COMMENT"
   fi
 
-  # 自定义链里：先允许 lo（本机访问永远放行）
+  # 允许本机
   if ! iptables -C "$CHAIN" -i lo -j ACCEPT >/dev/null 2>&1; then
     iptables -I "$CHAIN" 1 -i lo -j ACCEPT
   fi
 
-  # 删除旧的“最终 DROP”（避免重复 & 确保 DROP 在最后）
+  # 先移除旧 DROP，最后再加，保证 DROP 永远在链尾
   while iptables -C "$CHAIN" -p tcp -m multiport --dports ${PORTS} -j DROP -m comment --comment "$DROP_COMMENT" >/dev/null 2>&1; do
     iptables -D "$CHAIN" -p tcp -m multiport --dports ${PORTS} -j DROP -m comment --comment "$DROP_COMMENT"
   done
@@ -141,53 +149,46 @@ ensure_chain_and_hook() {
 
 add_allow_ip() {
   local ip="$1"
-  # 允许规则放在 DROP 之前；为避免重复，先检查 -C
   if iptables -C "$CHAIN" -p tcp -s "$ip" -m multiport --dports ${PORTS} -j ACCEPT -m comment --comment "$ALLOW_COMMENT" >/dev/null 2>&1; then
     yellow "已存在放行规则：$ip"
     return 0
   fi
-  # 插入到链尾部（DROP 还没加回去，或稍后加回去）
   iptables -A "$CHAIN" -p tcp -s "$ip" -m multiport --dports ${PORTS} -j ACCEPT -m comment --comment "$ALLOW_COMMENT"
   green "已放行：$ip -> TCP ${PORTS}"
 }
 
 finalize_drop_all_others() {
-  # 在链尾追加最终 DROP（确保其它全部拒绝）
-  if ! iptables -C "$CHAIN" -p tcp -m multiport --dports ${PORTS} -j DROP -m comment --comment "$DROP_COMMENT" >/dev/null 2>&1; then
-    iptables -A "$CHAIN" -p tcp -m multiport --dports ${PORTS} -j DROP -m comment --comment "$DROP_COMMENT"
-  fi
+  iptables -C "$CHAIN" -p tcp -m multiport --dports ${PORTS} -j DROP -m comment --comment "$DROP_COMMENT" >/dev/null 2>&1 \
+    || iptables -A "$CHAIN" -p tcp -m multiport --dports ${PORTS} -j DROP -m comment --comment "$DROP_COMMENT"
 }
 
-save_rules() {
+save_rules_strict() {
   local fam; fam="$(detect_os_family)"
 
   if [[ "$fam" == "debian" ]]; then
-    if has_cmd netfilter-persistent; then
-      netfilter-persistent save
-      green "已保存规则（netfilter-persistent save）。"
-      return 0
+    # Debian/Ubuntu：强制用 netfilter-persistent 保存，保证重启加载
+    if ! has_cmd netfilter-persistent; then
+      red "未找到 netfilter-persistent（iptables-persistent 未正确安装），无法保证重启恢复。"
+      exit 1
     fi
-    # 兜底：iptables-save -> rules.v4
-    if has_cmd iptables-save; then
-      mkdir -p /etc/iptables
-      iptables-save > /etc/iptables/rules.v4
-      green "已保存规则到 /etc/iptables/rules.v4（兜底保存）。"
-      return 0
-    fi
-  elif [[ "$fam" == "rhel" ]]; then
+    netfilter-persistent save
+    green "已保存规则（netfilter-persistent save），重启后会自动恢复。"
+    return 0
+  fi
+
+  # RHEL 兜底
+  if [[ "$fam" == "rhel" ]]; then
     if has_cmd service && service iptables status >/dev/null 2>&1; then
       service iptables save
       green "已保存规则（service iptables save）。"
       return 0
     fi
-    if has_cmd iptables-save; then
-      iptables-save > /etc/sysconfig/iptables
-      green "已保存规则到 /etc/sysconfig/iptables（兜底保存）。"
-      return 0
-    fi
   fi
 
-  yellow "未检测到可用的持久化保存命令。你可以手动保存：iptables-save > /etc/iptables/rules.v4"
+  # 其它：至少落地 rules.v4（但不保证自动加载）
+  mkdir -p /etc/iptables
+  iptables-save > /etc/iptables/rules.v4
+  yellow "已保存到 /etc/iptables/rules.v4（但系统未必会开机自动加载）。"
 }
 
 show_result() {
@@ -198,25 +199,16 @@ show_result() {
   iptables -S "$CHAIN" || true
   echo "===================================================="
   echo
-  yellow "说明："
-  echo "1) 只有你添加的 IP/CIDR 能访问 TCP 9100/9115"
-  echo "2) 其他所有来源访问 9100/9115 都会被 DROP"
-  echo "3) 不影响其它端口（SSH 等不会被改动）"
 }
 
 main() {
   require_root
 
+  # 不论是否已安装 iptables，都确保“持久化组件”到位（Debian 系重点）
   if ! has_cmd iptables; then
     yellow "未检测到 iptables 命令。"
-    install_iptables_and_persist
   fi
-
-  # 再次确认
-  if ! has_cmd iptables; then
-    red "iptables 仍不可用，退出。"
-    exit 1
-  fi
+  install_iptables_and_persist_other
 
   ensure_chain_and_hook
 
@@ -234,7 +226,6 @@ main() {
       yellow "输入为空，请重新输入。"
       continue
     fi
-
     if ! valid_ip_or_cidr "$ip"; then
       red "IP/CIDR 格式不合法：$ip"
       continue
@@ -248,10 +239,9 @@ main() {
   done
 
   finalize_drop_all_others
-  save_rules
+  save_rules_strict
   show_result
-
-  green "完成 ✅"
+  green "完成 ✅（重启后依旧生效）"
 }
 
 main "$@"
