@@ -24,6 +24,11 @@ curl -fsSL https://raw.githubusercontent.com/Jaydooooooo/grafana/main/grafana_in
 systemctl restart prometheus
 ```
 
+重启grafana
+```bash
+systemctl restart grafana-server
+```
+
 
 【中文版性能检测22869】
 ```bash
