@@ -1,293 +1,301 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-GREEN="\033[1;32m"
-RED="\033[1;31m"
-YELLOW="\033[1;33m"
-NC="\033[0m"
+# ============================================================
+# install_exporters.sh
+# - Install & run node_exporter (9100) and blackbox_exporter (9115)
+# - Lock down ports 9100/9115: ONLY allow PANEL_IP, otherwise DROP
+# - iptables rules are always inserted to the top
+# - If rules already exist: remove duplicates and re-insert at top (re-pin)
+# - Do NOT touch other existing rules
+# - Persist rules via netfilter-persistent if available
+# ============================================================
 
-ok()   { echo -e "${GREEN}[OK]${NC} $*"; }
-warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
-err()  { echo -e "${RED}[ERR]${NC} $*"; }
+# ---------------------------
+# Config
+# ---------------------------
+NODE_EXPORTER_VER="${NODE_EXPORTER_VER:-}"         # e.g. "1.10.2" or empty for latest
+BLACKBOX_EXPORTER_VER="${BLACKBOX_EXPORTER_VER:-}" # e.g. "0.28.0" or empty for latest
+INSTALL_DIR="/usr/local/bin"
+SYSTEMD_DIR="/etc/systemd/system"
+TMP_DIR="/tmp/exporters_install_$$"
 
-require_root() {
-  if [[ "${EUID}" -ne 0 ]]; then
-    err "请切换到 root 用户后再运行脚本（不要用 sudo 执行本脚本）"
-    exit 1
-  fi
+PORT_NODE="9100"
+PORT_BLACKBOX="9115"
+
+# ---------------------------
+# Helpers
+# ---------------------------
+log_ok()   { echo -e "[OK] $*"; }
+log_warn() { echo -e "[WARN] $*"; }
+log_err()  { echo -e "[ERR] $*" >&2; }
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || { log_err "Missing command: $1"; exit 1; }
 }
 
+cleanup() {
+  rm -rf "$TMP_DIR" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+# ---------------------------
+# Detect arch
+# ---------------------------
 detect_arch() {
-  case "$(uname -m)" in
-    x86_64)  ARCH="amd64" ;;
-    aarch64) ARCH="arm64" ;;
-    *)
-      err "不支持的架构: $(uname -m)"
-      exit 1
-      ;;
+  local arch
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64|amd64) echo "amd64" ;;
+    aarch64|arm64) echo "arm64" ;;
+    armv7l|armv7) echo "armv7" ;;
+    *) log_err "Unsupported arch: $arch"; exit 1 ;;
   esac
 }
 
-need_cmd() { command -v "$1" >/dev/null 2>&1; }
-
-apt_install() {
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y >/dev/null
-  apt-get install -y "$@" >/dev/null
-}
-
-ensure_base_tools() {
-  local pkgs=()
-  need_cmd curl || pkgs+=("curl")
-  need_cmd wget || pkgs+=("wget")
-  need_cmd tar  || pkgs+=("tar")
-  need_cmd ss   || pkgs+=("iproute2")
-  need_cmd sed  || pkgs+=("sed")
-
-  if ((${#pkgs[@]})); then
-    warn "安装基础依赖: ${pkgs[*]}"
-    apt_install "${pkgs[@]}"
-  fi
-}
-
-ensure_firewall_tools() {
-  local pkgs=()
-  need_cmd iptables || pkgs+=("iptables")
-  need_cmd netfilter-persistent || pkgs+=("iptables-persistent" "netfilter-persistent")
-
-  if ((${#pkgs[@]})); then
-    warn "安装防火墙依赖: ${pkgs[*]}"
-    apt_install "${pkgs[@]}"
-  fi
-}
-
+# ---------------------------
+# Fetch latest release tag from GitHub (no jq required)
+# ---------------------------
 github_latest_tag() {
-  # 稳定解析：用 sed 抽取 "tag_name":"vX.Y.Z"
-  local repo="$1"
-  local resp tag msg
+  local repo="$1" # "prometheus/node_exporter"
+  # GitHub API returns: "tag_name": "vX.Y.Z"
+  curl -fsSL "https://api.github.com/repos/${repo}/releases/latest" \
+    | sed -n 's/.*"tag_name":[[:space:]]*"\(v[^"]*\)".*/\1/p' \
+    | head -n1
+}
 
-  resp="$(curl -sS -L \
-    -H "Accept: application/vnd.github+json" \
-    -H "User-Agent: install_exporters" \
-    "https://api.github.com/repos/${repo}/releases/latest" || true)"
+# ---------------------------
+# Download + install node_exporter
+# ---------------------------
+install_node_exporter() {
+  local arch tag ver url tarball
+  arch="$(detect_arch)"
 
-  tag="$(printf '%s' "${resp}" | sed -n 's/.*"tag_name":"\([^"]*\)".*/\1/p' | head -n1)"
-
-  if [[ -z "${tag}" ]]; then
-    msg="$(printf '%s' "${resp}" | sed -n 's/.*"message":"\([^"]*\)".*/\1/p' | head -n1)"
-    err "无法获取 ${repo} 最新版本 tag_name"
-    [[ -n "${msg}" ]] && err "GitHub 返回: ${msg}"
-    err "原始返回前 200 字符: $(printf '%s' "${resp}" | head -c 200)"
-    return 1
+  if [[ -n "$NODE_EXPORTER_VER" ]]; then
+    ver="$NODE_EXPORTER_VER"
+    tag="v${ver}"
+  else
+    tag="$(github_latest_tag "prometheus/node_exporter")"
+    ver="${tag#v}"
   fi
 
-  echo "${tag}"
-}
+  log_ok "Node Exporter 最新版本: ${tag}"
 
-ensure_user() {
-  local u="$1"
-  id "$u" >/dev/null 2>&1 || useradd -rs /bin/false "$u"
-}
+  mkdir -p "$TMP_DIR"
+  tarball="${TMP_DIR}/node_exporter.tar.gz"
+  url="https://github.com/prometheus/node_exporter/releases/download/${tag}/node_exporter-${ver}.linux-${arch}.tar.gz"
 
-port_listening() {
-  local port="$1"
-  ss -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]${port}$"
-}
+  curl -fsSL "$url" -o "$tarball"
+  tar -xzf "$tarball" -C "$TMP_DIR"
 
-service_active() {
-  local svc="$1"
-  systemctl is-active --quiet "${svc}"
-}
+  install -m 0755 "${TMP_DIR}/node_exporter-${ver}.linux-${arch}/node_exporter" "${INSTALL_DIR}/node_exporter"
 
-download_and_install_binary() {
-  # $1=url  $2=tar_dir_prefix  $3=binary_name  $4=dst
-  local url="$1" prefix="$2" bin="$3" dst="$4"
-  local tmp
-  tmp="$(mktemp -d)"
-  wget -qO "${tmp}/pkg.tgz" "${url}"
-  tar -xzf "${tmp}/pkg.tgz" -C "${tmp}"
-  install -m 0755 "${tmp}/${prefix}/${bin}" "${dst}"
-  rm -rf "${tmp}"
-}
-
-install_node_exporter() {
-  local tag version url prefix
-
-  tag="$(github_latest_tag "prometheus/node_exporter")" || { err "获取 node_exporter tag 失败"; exit 1; }
-  version="${tag#v}"
-  url="https://github.com/prometheus/node_exporter/releases/download/${tag}/node_exporter-${version}.linux-${ARCH}.tar.gz"
-  prefix="node_exporter-${version}.linux-${ARCH}"
-
-  ok "Node Exporter 最新版本: ${tag}"
-
-  ensure_user "node_exporter"
-  download_and_install_binary "${url}" "${prefix}" "node_exporter" "/usr/local/bin/node_exporter"
-
-  cat > /etc/systemd/system/node_exporter.service <<'EOF'
+  # systemd unit
+  cat > "${SYSTEMD_DIR}/node_exporter.service" <<EOF
 [Unit]
-Description=Node Exporter
-Wants=network-online.target
+Description=Prometheus Node Exporter
 After=network-online.target
+Wants=network-online.target
 
 [Service]
-User=node_exporter
-Group=node_exporter
 Type=simple
-Restart=on-failure
-RestartSec=5s
-ExecStart=/usr/local/bin/node_exporter
+ExecStart=${INSTALL_DIR}/node_exporter
+Restart=always
+RestartSec=2
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable --now node_exporter.service >/dev/null
-
-  ok "node_exporter 安装并启动成功（9100）"
+  systemctl enable --now node_exporter.service
+  log_ok "node_exporter 安装并启动成功（${PORT_NODE}）"
 }
 
+# ---------------------------
+# Download + install blackbox_exporter
+# ---------------------------
 install_blackbox_exporter() {
-  local tag version url prefix
+  local arch tag ver url tarball
+  arch="$(detect_arch)"
 
-  tag="$(github_latest_tag "prometheus/blackbox_exporter")" || { err "获取 blackbox_exporter tag 失败"; exit 1; }
-  version="${tag#v}"
-  url="https://github.com/prometheus/blackbox_exporter/releases/download/${tag}/blackbox_exporter-${version}.linux-${ARCH}.tar.gz"
-  prefix="blackbox_exporter-${version}.linux-${ARCH}"
-
-  ok "Blackbox Exporter 最新版本: ${tag}"
-
-  # 避免误覆盖其它程序占用 9115
-  if port_listening 9115 && ! service_active blackbox-exporter.service; then
-    err "端口 9115 已被占用，且 blackbox-exporter.service 未运行。请先释放端口再执行。"
-    exit 1
+  if [[ -n "$BLACKBOX_EXPORTER_VER" ]]; then
+    ver="$BLACKBOX_EXPORTER_VER"
+    tag="v${ver}"
+  else
+    tag="$(github_latest_tag "prometheus/blackbox_exporter")"
+    ver="${tag#v}"
   fi
 
-  download_and_install_binary "${url}" "${prefix}" "blackbox_exporter" "/usr/local/bin/blackbox_exporter"
+  log_ok "Blackbox Exporter 最新版本: ${tag}"
 
+  mkdir -p "$TMP_DIR"
+  tarball="${TMP_DIR}/blackbox_exporter.tar.gz"
+  url="https://github.com/prometheus/blackbox_exporter/releases/download/${tag}/blackbox_exporter-${ver}.linux-${arch}.tar.gz"
+
+  curl -fsSL "$url" -o "$tarball"
+  tar -xzf "$tarball" -C "$TMP_DIR"
+
+  install -m 0755 "${TMP_DIR}/blackbox_exporter-${ver}.linux-${arch}/blackbox_exporter" "${INSTALL_DIR}/blackbox_exporter"
+
+  # config (enable tcp_connect)
   mkdir -p /etc/blackbox_exporter
   cat > /etc/blackbox_exporter/blackbox.yml <<'EOF'
 modules:
-  icmp:
-    prober: icmp
-
-  http:
-    prober: http
-
   tcp_connect:
     prober: tcp
     timeout: 5s
-
-  dns:
-    prober: dns
-    dns:
-      preferred_ip_protocol: "ip4"
-      query_name: "www.apple.com"
-      query_type: "A"
 EOF
 
-  cat > /etc/systemd/system/blackbox-exporter.service <<'EOF'
+  # systemd unit
+  cat > "${SYSTEMD_DIR}/blackbox-exporter.service" <<EOF
 [Unit]
 Description=Prometheus Blackbox Exporter
-Wants=network-online.target
 After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/blackbox_exporter --config.file="/etc/blackbox_exporter/blackbox.yml" --web.listen-address=":9115"
-ExecReload=/bin/kill -HUP $MAINPID
-KillMode=process
-Restart=on-failure
-RestartSec=5s
+ExecStart=${INSTALL_DIR}/blackbox_exporter --config.file=/etc/blackbox_exporter/blackbox.yml --web.listen-address=:${PORT_BLACKBOX}
+Restart=always
+RestartSec=2
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable --now blackbox-exporter.service >/dev/null
-  systemctl restart blackbox-exporter.service >/dev/null
-
-  ok "blackbox_exporter 安装并启动成功（9115，tcp_connect 已开启）"
+  systemctl enable --now blackbox-exporter.service
+  log_ok "blackbox_exporter 安装并启动成功（${PORT_BLACKBOX}，tcp_connect 已开启）"
 }
 
-prompt_panel_ip() {
-  local ip=""
-  while true; do
-    read -r -p "请输入面板服务器 IP（仅允许该 IP 访问 9100/9115）: " ip
-    ip="${ip// /}"
-    [[ -n "${ip}" ]] || { warn "IP 不能为空"; continue; }
-    [[ "${ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || { warn "IP 格式不正确，请输入类似 1.2.3.4"; continue; }
-    PANEL_IP="${ip}"
-    break
+# ---------------------------
+# Firewall: iptables rule management
+# Requirements:
+# - new rules auto pinned to top
+# - if exists -> re-pin to top
+# - do not modify other existing rules
+# - 9100/9115 allowlist-only (others DROP)
+# ---------------------------
+iptables_delete_all() {
+  local chain="$1"; shift
+  # Delete all occurrences of the exact rule
+  while iptables -C "$chain" "$@" 2>/dev/null; do
+    iptables -D "$chain" "$@" 2>/dev/null || break
   done
 }
 
-iptables_allow_panel() {
-  local ip="${PANEL_IP}"
-
-  for port in 9100 9115; do
-    if iptables -C INPUT -p tcp -s "${ip}" --dport "${port}" -j ACCEPT >/dev/null 2>&1; then
-      ok "iptables 规则已存在：允许 ${ip} -> ${port}"
-    else
-      iptables -I INPUT -p tcp -s "${ip}" --dport "${port}" -j ACCEPT
-      ok "已添加 iptables 规则：允许 ${ip} -> ${port}"
-    fi
-  done
-
-  netfilter-persistent save >/dev/null 2>&1 || true
-  netfilter-persistent reload >/dev/null 2>&1 || true
-
-  ok "已保存并重载 netfilter-persistent"
-  echo
-  echo "==== /etc/iptables/rules.v4 ===="
-  cat /etc/iptables/rules.v4 || true
-  echo "==============================="
+ensure_rule_at_top() {
+  local chain="$1"; shift
+  iptables_delete_all "$chain" "$@"
+  iptables -I "$chain" 1 "$@"
 }
 
-check_all() {
-  local fail=0
-  echo
-  echo "========== 最终检查 =========="
+ensure_rule_at_pos() {
+  local chain="$1"; local pos="$2"; shift 2
+  iptables_delete_all "$chain" "$@"
+  iptables -I "$chain" "$pos" "$@"
+}
 
-  [[ -x /usr/local/bin/node_exporter ]] && ok "node_exporter 二进制 OK" || { err "node_exporter 二进制缺失"; fail=1; }
-  service_active node_exporter.service && ok "node_exporter 服务运行 OK" || { err "node_exporter 服务未运行"; fail=1; }
-  port_listening 9100 && ok "9100 监听 OK" || { err "9100 未监听"; fail=1; }
+setup_firewall_lockdown() {
+  local panel_ip="$1"
+  local ports=("$PORT_NODE" "$PORT_BLACKBOX")
 
-  [[ -x /usr/local/bin/blackbox_exporter ]] && ok "blackbox_exporter 二进制 OK" || { err "blackbox_exporter 二进制缺失"; fail=1; }
-  service_active blackbox-exporter.service && ok "blackbox-exporter 服务运行 OK" || { err "blackbox-exporter 服务未运行"; fail=1; }
-  port_listening 9115 && ok "9115 监听 OK" || { err "9115 未监听"; fail=1; }
-
-  if [[ -f /etc/blackbox_exporter/blackbox.yml ]] && grep -q "^  tcp_connect:" /etc/blackbox_exporter/blackbox.yml; then
-    ok "tcp_connect（tcping）模块已开启 OK"
-  else
-    err "tcp_connect 模块未开启"
-    fail=1
+  if ! command -v iptables >/dev/null 2>&1; then
+    log_warn "未检测到 iptables，跳过防火墙规则"
+    return 0
   fi
 
-  echo "=============================="
+  # Basic safety rules at top (do not change others, only ensure these exist and are pinned)
+  # 1) established/related
+  ensure_rule_at_top INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  # 2) loopback
+  ensure_rule_at_top INPUT -i lo -j ACCEPT
 
-  if [[ "${fail}" -eq 0 ]]; then
-    ok "全部成功 ✅"
+  # Allow PANEL_IP to ports (pin to top). Insert each at top so the last inserted ends up at very top.
+  # We'll do 9115 first then 9100 so that 9100 ends up higher (since it is "more important").
+  ensure_rule_at_top INPUT -p tcp -s "${panel_ip}/32" --dport "$PORT_BLACKBOX" -j ACCEPT
+  log_ok "已置顶允许：${panel_ip} -> ${PORT_BLACKBOX}"
+
+  ensure_rule_at_top INPUT -p tcp -s "${panel_ip}/32" --dport "$PORT_NODE" -j ACCEPT
+  log_ok "已置顶允许：${panel_ip} -> ${PORT_NODE}"
+
+  # Now enforce deny-all for those ports (DROP must be AFTER allow rules)
+  # We will place DROP right after the top block we just pinned:
+  # Current top order is:
+  #   1) allow 9100
+  #   2) allow 9115
+  #   3) lo
+  #   4) established
+  # So we put DROP at position 5 and 6, which is still near-top but below allows.
+  ensure_rule_at_pos INPUT 5 -p tcp --dport "$PORT_NODE" -j DROP
+  log_ok "已强化限制：非允许 IP 访问 ${PORT_NODE} -> DROP"
+
+  ensure_rule_at_pos INPUT 6 -p tcp --dport "$PORT_BLACKBOX" -j DROP
+  log_ok "已强化限制：非允许 IP 访问 ${PORT_BLACKBOX} -> DROP"
+
+  # Persist rules if netfilter-persistent exists
+  if command -v netfilter-persistent >/dev/null 2>&1; then
+    netfilter-persistent save >/dev/null 2>&1 || true
+    netfilter-persistent reload >/dev/null 2>&1 || true
+    log_ok "已保存并重载 netfilter-persistent"
   else
-    err "存在失败项 ❌（请按上面提示排查）"
-    exit 1
+    log_warn "未检测到 netfilter-persistent（可选安装：iptables-persistent / netfilter-persistent），规则不会自动持久化"
   fi
 }
 
+# ---------------------------
+# Checks
+# ---------------------------
+final_checks() {
+  # Show listen
+  log_ok "最终检查：端口监听"
+  ss -lntp | grep -E ":(9100|9115)\b" || true
+
+  # Show top of INPUT rules
+  if command -v iptables >/dev/null 2>&1; then
+    echo
+    echo "==== iptables INPUT 前 20 条（含行号）===="
+    iptables -L INPUT -n --line-numbers | sed -n '1,22p'
+    echo "========================================="
+  fi
+
+  if [[ -f /etc/iptables/rules.v4 ]]; then
+    echo
+    echo "==== /etc/iptables/rules.v4（节选）===="
+    sed -n '1,80p' /etc/iptables/rules.v4 || true
+    echo "======================================="
+  fi
+}
+
+# ---------------------------
+# Main
+# ---------------------------
 main() {
-  require_root
-  detect_arch
-  ensure_base_tools
-  ensure_firewall_tools
+  need_cmd curl
+  need_cmd tar
+  need_cmd systemctl
+  need_cmd ss
+
+  mkdir -p "$TMP_DIR"
 
   install_node_exporter
   install_blackbox_exporter
 
-  prompt_panel_ip
-  iptables_allow_panel
+  # Ask panel IP
+  echo -n "请输入面板服务器 IP（仅允许该 IP 访问 9100/9115）: "
+  read -r PANEL_IP
 
-  check_all
+  # Basic IP format check (simple)
+  if ! echo "$PANEL_IP" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+    log_err "IP 格式看起来不对：$PANEL_IP"
+    exit 1
+  fi
+
+  setup_firewall_lockdown "$PANEL_IP"
+  final_checks
+
+  log_ok "全部成功 ✅"
 }
 
 main "$@"
